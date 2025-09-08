@@ -4,22 +4,12 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
 import torch.nn.functional as F
 from transformers import AutoImageProcessor, AutoModel, AutoModelForImageClassification
+from timm.data.transforms_factory import create_transform
 
 MODEL_PATH = "/data2/yijin/MambaVision-L3-512-21K"
-
-import math
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from PIL import Image
-from timm.data.transforms_factory import create_transform
-from transformers import AutoModel
-
 
 class MemoryModule(nn.Module):
     """

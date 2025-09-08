@@ -66,7 +66,7 @@ class MultiScaleDecoder(nn.Module):
             Reconstructed image of shape (B, C, target_size, target_size)
         """
         decoded_feats = []
-        for feat, decoder in sip(fused_feats, self.decoders):
+        for feat, decoder in zip(fused_feats, self.decoders):
             decoded = decoder(feat)
             # Ensure all decoded features have the same spatial size
             if decoded.shape[-1] != self.target_size:

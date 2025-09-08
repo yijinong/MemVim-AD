@@ -9,15 +9,16 @@ from pathlib import Path
 # Add the src directory to Python path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from .mvtec_data.dataset import MVTecADJSONDataModule, MVTecADJSONDataset
+from .mvtec_data.load_dataset import MVTecADJSONDataModule, MVTecADJSONDataset
 
 
 def test_json_dataset():
     """Test the JSON dataset implementation"""
 
     # Paths
-    train_json = "/home/yijin/projects/pro-ad/data/mvtec-ad/train.json"
-    data_root = "/home/yijin/projects/pro-ad/data/mvtec-ad"
+    train_json = "/home/yijin/projects/MemVim-AD/data/mvtec-ad/train.json"
+    test_json = "/home/yijin/projects/MemVim-AD/data/mvtec-ad/test.json"
+    data_root = "/home/yijin/projects/MemVim-AD/data/mvtec-ad"
 
     print("Testing MVTecADJSONDataset...")
 
@@ -58,6 +59,7 @@ def test_json_dataset():
 
     data_module = MVTecADJSONDataModule(
         train_json=train_json,
+        test_json=test_json,
         root_dir=data_root,
         category="zipper",
         batch_size=4,
@@ -65,7 +67,7 @@ def test_json_dataset():
     )
 
     # Test dataloaders
-    train_loader = data_module.get_train_dataloader()
+    train_loader = data_module.get_train_loader()
     print(f"Train dataloader batch size: {train_loader.batch_size}")
     print(f"Train dataset size: {len(train_loader.dataset)}")
 

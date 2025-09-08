@@ -1,4 +1,3 @@
-from .dataset import MVTecADDataModule
-from .multi_cls_loader import MultiCategoryMVTecAD
+from .load_dataset import MVTecADJSONDataModule, MVTecADJSONDataset
 
-__all__ = ["MultiCategoryMVTecAD", "MVTecADDataModule"]
+__all__ = ["MVTecADJSONDataModule", "MVTecADJSONDataset"]

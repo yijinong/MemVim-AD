@@ -1,12 +1,14 @@
-from typing import Dict, List
+from typing import Dict, List, Tuple, Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoModel
 
 from .decoder import MultiScaleDecoder
 from .gating_mech import MultiScaledGatingMechanism
-from .memory import MemoryModule
+from .hierarchy_proto import HierarchicalPrototypeMemory
+from ..loss_func import ContrastiveLoss, PrototypeAlignmentLoss
 
 MODEL_PATH = "/data2/yijin/MambaVision-L3-512-21K"
 
@@ -74,10 +76,13 @@ class MemVim(nn.Module):
                         )
                         self.feat_dims[i] = actual_dim  # Use actual dimension
 
-        # Memory modules for each selected stage
+        # Hierarchical memory modules for each selected stage
+        from .hierarchy_proto import HierarchicalPrototypeMemory
+        self.k_coarse = 8  # reasonable default for coarse clusters
+        self.k_fine = 16   # reasonable default for fine clusters per coarse
         self.memories = nn.ModuleList()
         for dim in self.feat_dims:
-            memory = MemoryModule(num_proto, dim, temp)
+            memory = HierarchicalPrototypeMemory(feature_dim=dim, k_coarse=self.k_coarse, k_fine=self.k_fine)
             self.memories.append(memory)
 
         # Multi-scale gating mechanism
@@ -89,10 +94,14 @@ class MemVim(nn.Module):
         )
 
         # Loss weights
-        self.alpha = alpha
-        self.beta = beta
-        self.lambda_weight = lambda_weight
+        self.alpha = alpha  # weight for contrastive loss
+        self.beta = beta    # weight for memory loss
+        self.lambda_weight = lambda_weight  # weight for prototype alignment loss
 
+        # Loss functions
+        self.contrastive_loss = ContrastiveLoss(temperature=temp)
+        self.proto_loss = PrototypeAlignmentLoss(use_vectorized=True)
+        
         # For continual learning
         # Track which prototypes to freeze
         self.frozen_proto = 0
@@ -121,16 +130,18 @@ class MemVim(nn.Module):
         # Select features from specified stages
         selected_feats = [all_feats[i - 1] for i in self.use_stages]
 
-        # Query memory for each scale
-        retrieved_feats = []
-        all_attn_weights = []
-        all_entropy_scores = []
-
+        # Initialize hierarchical prototypes if not done
         for feat, mem in zip(selected_feats, self.memories):
-            retrieved_feat, attn_weights, entropy_scores = mem(feat)
-            retrieved_feats.append(retrieved_feat)
-            all_attn_weights.append(attn_weights)
-            all_entropy_scores.append(entropy_scores)
+            if mem.coarse_prototypes is None:
+                mem.initialize_prototypes(feat.detach())
+
+        # For demonstration, anomaly scores from hierarchical memory
+        anomaly_scores = [mem.compute_anomaly_score(feat) for feat, mem in zip(selected_feats, self.memories)]
+
+        # For compatibility, set retrieved_feats, attn_weights, entropy_scores to None
+        retrieved_feats = [None for _ in selected_feats]
+        all_attn_weights = [None for _ in selected_feats]
+        all_entropy_scores = [None for _ in selected_feats]
 
         # Fuse original and retrieved features at each scale
         fused_feats = self.gating(selected_feats, retrieved_feats)
@@ -144,7 +155,133 @@ class MemVim(nn.Module):
             "retrieved_features": retrieved_feats,
             "attention_weights": all_attn_weights,
             "entropy_scores": all_entropy_scores,
+            "anomaly_scores": anomaly_scores,
+            "memories": self.memories,
         }
+
+    def compute_loss(self, inputs: torch.Tensor, outputs: Dict[str, Any]) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute the total loss for training.
+        
+        Args:
+            inputs: The original input images
+            outputs: The dictionary of outputs from forward pass
+            
+        Returns:
+            total_loss: The combined loss for optimization
+            loss_dict: Dictionary containing individual loss terms
+        """
+        # Reconstruction loss
+        recon_loss = F.mse_loss(outputs["reconstructed"], inputs)
+        
+        # Contrastive loss on features
+        contrast_loss = sum(
+            self.contrastive_loss(feat) for feat in outputs["features"]
+        ) / len(outputs["features"])
+        
+        # Prototype alignment loss for each scale (using hierarchical memory)
+        proto_loss = 0.0
+        for feat, memory_module in zip(outputs["features"], outputs["memories"]):
+            proto_loss += self.proto_loss(feat, memory_module)
+        proto_loss /= len(outputs["features"])
+        # For demonstration, set memory_loss to 0.0 (can be replaced with hierarchical entropy or other metric)
+        memory_loss = 0.0
+        
+        # Combine losses with weights
+        total_loss = (
+            recon_loss + 
+            self.alpha * contrast_loss + 
+            self.beta * memory_loss +
+            self.lambda_weight * proto_loss
+        )
+        
+        loss_dict = {
+            "total": total_loss.item(),
+            "reconstruction": recon_loss.item(),
+            "contrastive": contrast_loss.item(),
+            "memory": memory_loss.item(),
+            "prototype": proto_loss.item(),
+        }
+        
+        return total_loss, loss_dict
+
+    def compute_anomaly_score(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute pixel-level and image-level anomaly scores.
+
+        Returns:
+            pixel_scores: Pixel-level anomaly map (B, H, W)
+            image_scores: Image-level anomaly scores (B,)
+        """
+        with torch.no_grad():
+            outputs = self.forward(x)
+            reconstructed = outputs["reconstructed"]
+            all_entropy_scores = outputs["entropy_scores"]
+
+            # Reconstruction-based anomaly map
+            rec_anomaly = torch.mean(torch.abs(x - reconstructed), dim=1)  # (B, H, W)
+
+            # Memory-based anomaly map - combine entropy from all scales
+            mem_anomaly = torch.zeros_like(rec_anomaly)
+
+            for entropy_scores in all_entropy_scores:
+                if len(entropy_scores.shape) == 3:  # (B, H, W)
+                    # Upsample to target size if needed
+                    if entropy_scores.shape[-1] != self.input_size:
+                        entropy_upsampled = F.interpolate(
+                            entropy_scores.unsqueeze(1),
+                            size=(self.input_size, self.input_size),
+                            mode="bilinear",
+                            align_corners=False,
+                        ).squeeze(1)
+                    else:
+                        entropy_upsampled = entropy_scores
+                else:  # (B, N) - need to reshape to spatial
+                    B, N = entropy_scores.shape
+                    # Infer spatial dimensions from feature maps
+                    spatial_size = int(math.sqrt(N))
+                    entropy_spatial = entropy_scores.view(B, spatial_size, spatial_size)
+                    entropy_upsampled = F.interpolate(
+                        entropy_spatial.unsqueeze(1),
+                        size=(self.input_size, self.input_size),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(1)
+
+                mem_anomaly += entropy_upsampled
+
+            # Average entropy across scales
+            mem_anomaly /= len(all_entropy_scores)
+
+            # Combine anomaly maps
+            pixel_scores = (
+                1 - self.lambda_weight
+            ) * rec_anomaly + self.lambda_weight * mem_anomaly
+
+            # Image-level scores (max pooling)
+            image_scores = torch.max(
+                pixel_scores.view(pixel_scores.shape[0], -1), dim=1
+            )[0]
+
+            return pixel_scores, image_scores
+
+    def expand_for_new_class(self, new_prototypes: int = 128):
+        """
+        Expand memory for continual learning.
+        """
+        # Mark current prototypes as frozen
+        self.frozen_prototypes = self.memories[0].num_prototypes
+
+        # Expand memory for all scales
+        for memory in self.memories:
+            memory.expand_memory(new_prototypes)
+
+        print(
+            f"Memory expanded for all scales: {self.frozen_prototypes} -> {self.memories[0].num_prototypes} prototypes"
+        )
+
 
     def get_param_count(self):
         """
@@ -227,6 +364,22 @@ def main() -> None:
     print(f"Memory prototypes per scale: {model.memories[0].num_proto}")
     print(f"Feature dimensions per scale: {model.feat_dims}")
 
+    # Create dummy input (batch of 2 RGB images, 512x512)
+    batch_size = 2
+    input_size = 512
+    inputs = torch.randn(batch_size, 3, input_size, input_size)
+
+    # Forward pass
+    outputs = model(inputs)
+
+    # Compute loss
+    total_loss, loss_dict = model.compute_loss(inputs, outputs)
+    print("Loss breakdown:", loss_dict)
+
+    # Print anomaly scores
+    print("Anomaly scores (per scale):")
+    for i, score in enumerate(outputs["anomaly_scores"]):
+        print(f"Scale {i+1}: shape {score.shape}")
 
 if __name__ == "__main__":
     main()
